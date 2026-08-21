@@ -4,26 +4,62 @@ profiling_engine.py
 --------------------
 Pure data-profiling logic: does NOT depend on Qt widgets, only on the
 QGIS API (qgis.core) and numpy. This lets it be reused both from the
-dock (UI) and from a future Processing algorithm running in batch mode.
+dock (UI) and from profiling_task.py's background QgsTask.
 
-Every profiling function returns, in addition to the statistics, the
-feature ids of interest (nulls, outliers, extremes) already computed,
-so that selecting them on the map is instant and doesn't require
-re-scanning the layer.
+Performance note (this module targets large layers such as cadastral
+datasets, which can have hundreds of thousands of features with heavy
+geometries):
+
+  - profile_all_fields() computes statistics for EVERY requested field in
+    a SINGLE pass over the layer (one feature read = one update to every
+    field's running statistics), instead of one pass per field. The
+    feature request excludes geometry entirely, since none of this needs
+    it. This is what makes it practical to run on very large layers.
+  - Running statistics use streaming/online algorithms, so we never hold
+    the full column of values in memory: Welford's algorithm for mean/
+    variance (also numerically stable, unlike naive sum-of-squares, which
+    matters for fields with large values like cadastral coordinates or
+    areas), and reservoir sampling (bounded to HISTOGRAM_SAMPLE_LIMIT
+    values) for percentiles and the histogram/frequency chart, since QGIS
+    has no built-in "distribution shape" statistic. Distinct-value
+    tracking is also capped (DISTINCT_TRACK_LIMIT) so a near-unique field
+    (e.g. a cadastral reference) can't blow up memory.
+  - We do NOT precompute or store feature id lists for nulls/min/max/
+    outliers. The dock instead builds a small QGIS expression from the
+    already-known statistic (e.g. "field IS NULL", or "field = <max>")
+    and resolves it to feature ids lazily, only when the user actually
+    clicks that cell. See selection_helper.py.
+  - profiling_task.py wraps profile_all_fields() in a background QgsTask
+    so the QGIS UI thread is never blocked, however large the layer is.
 """
 
-from statistics import mean, median, pstdev, stdev
+import random
 
 try:
     import numpy as np
 except ImportError:  # numpy should always be available in QGIS, but just in case
     np = None
 
-from qgis.core import QgsField, NULL
+from qgis.core import NULL, QgsFeatureRequest, QgsField
 
 # Note: we use QgsField.isNumeric(), which is stable across QGIS versions
 # (this avoids depending on QVariant.Type vs QMetaType.Type, which differs
 # between the Qt5 and Qt6 builds of QGIS 3.28 -> 3.4x).
+
+# Percentiles/histogram/value_counts are computed from at most this many
+# values per field (reservoir sample for numeric fields; first-seen cap
+# for text categories), so a single huge field can't blow up memory or
+# runtime on a very large layer.
+HISTOGRAM_SAMPLE_LIMIT = 50_000
+
+# A numeric field's set of distinct values is only tracked up to this
+# size; beyond it we stop counting and report an approximate ">N".
+DISTINCT_TRACK_LIMIT = 20_000
+
+# A text field's category breakdown is only tracked up to this many
+# distinct categories; beyond it we stop adding new ones and report an
+# approximate ">N" (existing tracked categories keep accumulating counts).
+MAX_CATEGORIES_TRACKED = 500
 
 # Ordered list of statistic columns shown in the stats table, and whether
 # a click on that column's cell should trigger a map selection.
@@ -64,10 +100,6 @@ def stat_value(profile, key):
     field" and "all fields" table views in the dock stay consistent."""
     if key in NUMERIC_ONLY_KEYS and not profile.get('is_numeric'):
         return None
-    if key == 'outlier_count':
-        if not profile.get('is_numeric'):
-            return None
-        return len(profile.get('outlier_ids', []))
     return profile.get(key)
 
 
@@ -94,104 +126,256 @@ def list_fields(layer):
     return result
 
 
-def profile_field(layer, field_name):
-    """Computes statistics for a field plus the feature ids of interest
-    (nulls, outliers, minimum, maximum).
+# ----------------------------------------------------------------------
+# Streaming accumulators
+# ----------------------------------------------------------------------
 
-    Returns a dictionary with, among other keys:
-      - field_type, count, null_count, distinct_count
-      - null_ids: list[int]
-      - min_value, max_value, min_ids, max_ids, range (numeric only)
-      - sum, mean, median, std_dev, p25, p75 (numeric only)
-      - outlier_ids: list[int] (IQR method, numeric only)
-      - histogram: {'counts': [...], 'edges': [...]} (numeric only)
-      - value_counts: {value: count} (non-numeric / categorical fields only)
-    """
-    numeric = is_numeric_field(layer, field_name)
-
-    idx = layer.fields().indexFromName(field_name)
-    field_type_name = layer.fields().at(idx).typeName() if idx >= 0 else '-'
-
-    values = []          # non-null values
-    value_to_ids = {}     # value -> list of feature ids (for categorical values and extremes)
-    null_ids = []
-    total = 0
-
-    for feat in layer.getFeatures():
-        total += 1
-        val = feat[field_name]
-        # QGIS represents null attribute values with the NULL sentinel
-        # (not Python's None); comparing with `== NULL` is the way
-        # recommended by PyQGIS. We also cover NaN in case the data comes
-        # from an external numeric source (e.g. a join with pandas/numpy).
-        if val == NULL or val is None or (
-            isinstance(val, float) and np is not None and np.isnan(val)
-        ):
-            null_ids.append(feat.id())
-            continue
-        values.append(val)
-        value_to_ids.setdefault(val, []).append(feat.id())
-
-    profile = {
-        'field': field_name,
-        'field_type': field_type_name,
-        'is_numeric': numeric,
-        'count': total,
-        'null_count': len(null_ids),
-        'null_ids': null_ids,
-        'distinct_count': len(value_to_ids),
+def _new_numeric_acc():
+    return {
+        'count': 0,          # non-null count
+        'null_count': 0,
+        'min': None,
+        'max': None,
+        'mean': 0.0,          # Welford running mean
+        'm2': 0.0,            # Welford running sum of squared diffs
+        'distinct': set(),
+        'distinct_capped': False,
+        'reservoir': [],      # up to HISTOGRAM_SAMPLE_LIMIT raw values
     }
 
-    if not values:
+
+def _new_text_acc():
+    return {
+        'count': 0,
+        'null_count': 0,
+        'value_counts': {},
+        'categories_capped': False,
+    }
+
+
+def _update_numeric(acc, raw_value, rng):
+    if acc['min'] is None or raw_value < acc['min']:
+        acc['min'] = raw_value
+    if acc['max'] is None or raw_value > acc['max']:
+        acc['max'] = raw_value
+
+    value = float(raw_value)
+    acc['count'] += 1
+    n = acc['count']
+    delta = value - acc['mean']
+    acc['mean'] += delta / n
+    delta2 = value - acc['mean']
+    acc['m2'] += delta * delta2
+
+    if not acc['distinct_capped']:
+        acc['distinct'].add(raw_value)
+        if len(acc['distinct']) > DISTINCT_TRACK_LIMIT:
+            acc['distinct_capped'] = True
+
+    # Reservoir sampling (Algorithm R): keeps a uniform random sample of
+    # size HISTOGRAM_SAMPLE_LIMIT without ever holding more than that many
+    # values in memory, regardless of how many features the layer has.
+    reservoir = acc['reservoir']
+    if len(reservoir) < HISTOGRAM_SAMPLE_LIMIT:
+        reservoir.append(value)
+    else:
+        j = rng.randint(0, n - 1)
+        if j < HISTOGRAM_SAMPLE_LIMIT:
+            reservoir[j] = value
+
+
+def _update_text(acc, value_str):
+    acc['count'] += 1
+    vc = acc['value_counts']
+    if value_str in vc:
+        vc[value_str] += 1
+    elif not acc['categories_capped']:
+        vc[value_str] = 1
+        if len(vc) > MAX_CATEGORIES_TRACKED:
+            acc['categories_capped'] = True
+    # else: category cap already reached and this is a brand-new category;
+    # dropped rather than growing the dict without bound.
+
+
+def _finalize_numeric(acc, field_type_name, total):
+    n = acc['count']
+    distinct_count = len(acc['distinct'])
+    if acc['distinct_capped']:
+        distinct_count = f'>{distinct_count}'
+
+    profile = {
+        'field_type': field_type_name,
+        'is_numeric': True,
+        'count': total,
+        'null_count': acc['null_count'],
+        'distinct_count': distinct_count,
+        'sampled': n > HISTOGRAM_SAMPLE_LIMIT,
+    }
+
+    if n == 0:
+        profile.update({
+            'min_value': None, 'max_value': None, 'range': None, 'sum': None,
+            'mean': None, 'median': None, 'std_dev': None, 'p25': None, 'p75': None,
+            'outlier_bounds': None, 'outlier_count': 0, 'histogram': None,
+        })
         return profile
 
-    if numeric:
-        arr = np.array(values, dtype=float) if np is not None else None
-        v_min = min(values)
-        v_max = max(values)
-        profile.update({
-            'min_value': v_min,
-            'max_value': v_max,
-            'min_ids': value_to_ids.get(v_min, []),
-            'max_ids': value_to_ids.get(v_max, []),
-            'range': v_max - v_min,
-            'sum': sum(values),
-            'mean': mean(values),
-            'median': median(values),
-            'std_dev': stdev(values) if len(values) >= 2 else pstdev(values),
-        })
+    variance = acc['m2'] / (n - 1) if n > 1 else 0.0
+    std_dev = variance ** 0.5
+    total_sum = acc['mean'] * n
 
-        if np is not None and len(values) >= 4:
-            q1, q3 = np.percentile(arr, [25, 75])
-            iqr = q3 - q1
-            lower = q1 - 1.5 * iqr
-            upper = q3 + 1.5 * iqr
-            outlier_ids = [
-                fid
-                for val, ids in value_to_ids.items()
-                for fid in ids
-                if val < lower or val > upper
-            ]
-            profile['p25'] = q1
-            profile['p75'] = q3
-            profile['outlier_bounds'] = {'lower': lower, 'upper': upper}
-            profile['outlier_ids'] = outlier_ids
-        else:
-            profile['p25'] = profile['p75'] = None
-            profile['outlier_bounds'] = None
-            profile['outlier_ids'] = []
+    p25 = p75 = median_val = None
+    histogram = None
+    outlier_bounds = None
+    outlier_count = 0
 
-        if np is not None:
-            counts, edges = np.histogram(arr, bins='auto')
-            profile['histogram'] = {
-                'counts': counts.tolist(),
-                'edges': edges.tolist(),
-            }
-    else:
-        # Categorical / text field: use a value -> count breakdown.
-        profile['value_counts'] = {
-            str(val): len(ids) for val, ids in value_to_ids.items()
-        }
-        profile['value_to_ids'] = value_to_ids
+    sample = acc['reservoir']
+    if sample and np is not None:
+        arr = np.array(sample, dtype=float)
+        p25, median_val, p75 = (float(v) for v in np.percentile(arr, [25, 50, 75]))
+        counts, edges = np.histogram(arr, bins='auto')
+        histogram = {'counts': counts.tolist(), 'edges': edges.tolist()}
 
+        iqr = p75 - p25
+        lower = p25 - 1.5 * iqr
+        upper = p75 + 1.5 * iqr
+        outlier_bounds = {'lower': lower, 'upper': upper}
+        # Estimated from the sample and scaled up to the full population;
+        # the actual selection on click is always exact (it re-evaluates
+        # the expression against the whole layer), only this displayed
+        # count is an estimate for very large fields.
+        outlier_fraction = float(np.count_nonzero((arr < lower) | (arr > upper))) / len(sample)
+        outlier_count = int(round(outlier_fraction * n))
+
+    profile.update({
+        'min_value': acc['min'],
+        'max_value': acc['max'],
+        'range': acc['max'] - acc['min'],
+        'sum': total_sum,
+        'mean': acc['mean'],
+        'median': median_val,
+        'std_dev': std_dev,
+        'p25': p25,
+        'p75': p75,
+        'outlier_bounds': outlier_bounds,
+        'outlier_count': outlier_count,
+        'histogram': histogram,
+    })
     return profile
+
+
+def _finalize_text(acc, field_type_name, total):
+    distinct_count = len(acc['value_counts'])
+    if acc['categories_capped']:
+        distinct_count = f'>{distinct_count}'
+    return {
+        'field_type': field_type_name,
+        'is_numeric': False,
+        'count': total,
+        'null_count': acc['null_count'],
+        'distinct_count': distinct_count,
+        'value_counts': acc['value_counts'],
+        'sampled': False,  # every feature was scanned; only category variety is capped
+    }
+
+
+# ----------------------------------------------------------------------
+# Public entry points
+# ----------------------------------------------------------------------
+
+def profile_all_fields(get_features, fields, field_names, total_count,
+                        on_progress=None, is_canceled=None):
+    """Profiles every field in field_names with a SINGLE pass over the
+    layer's features.
+
+    :param get_features: callable(QgsFeatureRequest) -> iterable of
+        QgsFeature. Pass layer.getFeatures for the main thread, or a
+        QgsVectorLayerFeatureSource's getFeatures when running inside a
+        background QgsTask (see profiling_task.py).
+    :param fields: the layer's QgsFields (layer.fields()).
+    :param field_names: list of field names to profile.
+    :param total_count: layer.featureCount(), used for progress reporting.
+    :param on_progress: optional callable(percent: int).
+    :param is_canceled: optional callable() -> bool; checked periodically
+        so a background task can be canceled cleanly. Returns None if
+        canceled partway through.
+    :returns: dict field_name -> profile dict, or None if canceled.
+    """
+    field_indexes = {}
+    numeric_flags = {}
+    type_names = {}
+    for name in field_names:
+        idx = fields.indexFromName(name)
+        field_indexes[name] = idx
+        if idx >= 0:
+            field = fields.at(idx)
+            numeric_flags[name] = field.isNumeric()
+            type_names[name] = field.typeName()
+        else:
+            numeric_flags[name] = False
+            type_names[name] = '-'
+
+    accumulators = {
+        name: (_new_numeric_acc() if numeric_flags[name] else _new_text_acc())
+        for name in field_names
+    }
+
+    request = QgsFeatureRequest()
+    valid_indexes = [idx for idx in field_indexes.values() if idx >= 0]
+    if valid_indexes:
+        request.setSubsetOfAttributes(valid_indexes)
+    request.setFlags(QgsFeatureRequest.Flag.NoGeometry)
+
+    # Fixed seed: profiling the same static layer twice in a row gives a
+    # stable sample, so the chart doesn't jitter between successive
+    # "Refresh" clicks on unchanged data.
+    rng = random.Random(42)
+
+    processed = 0
+    report_every = max(1, total_count // 100) if total_count else 1
+
+    for feat in get_features(request):
+        if is_canceled is not None and is_canceled():
+            return None
+
+        for name in field_names:
+            if field_indexes[name] < 0:
+                continue
+            val = feat[name]
+            acc = accumulators[name]
+            if val == NULL or val is None:
+                acc['null_count'] += 1
+                continue
+            if numeric_flags[name]:
+                _update_numeric(acc, val, rng)
+            else:
+                _update_text(acc, str(val))
+
+        processed += 1
+        if on_progress is not None and processed % report_every == 0:
+            pct = int(processed / total_count * 100) if total_count else 0
+            on_progress(min(pct, 99))
+
+    if on_progress is not None:
+        on_progress(100)
+
+    profiles = {}
+    for name in field_names:
+        acc = accumulators[name]
+        if numeric_flags[name]:
+            profile = _finalize_numeric(acc, type_names[name], total_count)
+        else:
+            profile = _finalize_text(acc, type_names[name], total_count)
+        profile['field'] = name
+        profiles[name] = profile
+
+    return profiles
+
+
+def profile_field(layer, field_name):
+    """Convenience wrapper for profiling a single field synchronously on
+    the main thread (used where a background task would be overkill)."""
+    result = profile_all_fields(
+        layer.getFeatures, layer.fields(), [field_name], layer.featureCount(),
+    )
+    return result[field_name] if result else None

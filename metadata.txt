@@ -2,7 +2,7 @@
 name=Data Engineering Toolkit
 qgisMinimumVersion=3.28
 description=Panel for profiling, cleaning and exploring vector data, inspired by the Data Engineering view in ArcGIS Pro, with interactive feature selection from statistics and charts.
-version=0.4.0
+version=0.6.0
 author=Pep
 email=pepquevedougr@gmail.com
 

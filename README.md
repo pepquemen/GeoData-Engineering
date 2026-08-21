@@ -14,7 +14,8 @@ data_engineering_toolkit/
 ├── metadata.txt                 # plugin metadata (name, version...)
 ├── data_engineering_plugin.py   # plugin lifecycle (initGui/unload)
 ├── data_engineering_dock.py     # UI: splitter (field list | stats table + chart)
-├── profiling_engine.py          # pure logic: statistics, IQR outliers, histogram
+├── profiling_engine.py          # pure logic: single-pass streaming statistics, IQR outliers, histogram
+├── profiling_task.py            # runs profiling_engine on a background QgsTask (progress bar, non-blocking UI)
 ├── selection_helper.py          # reusable feature selection (table and chart)
 ├── symbology_helper.py          # "explore by field" graduated / categorized renderers
 └── icons/icon.svg
@@ -47,7 +48,38 @@ each change.
   interpreter QGIS uses (on OSGeo4W: `OSGeo4W Shell` → `py3_env` →
   `pip install matplotlib`).
 
-## Current status (v0.4.0)
+## Current status (v0.6.0)
+
+### Performance on large layers (e.g. cadastral data)
+
+Profiling runs on a background `QgsTask` (`profiling_task.py`), so the
+QGIS UI is never blocked, however large the layer is — a progress bar in
+the panel header shows it's working. Reading features happens through a
+`QgsVectorLayerFeatureSource` cloned on the main thread before the task
+starts, which is the QGIS-documented safe way to read a layer's features
+from a worker thread.
+
+`profiling_engine.profile_all_fields()` computes every field's
+statistics in a **single pass** over the layer (previously it was one
+pass per field, and before that even one pass per statistic). Geometry
+is never read. Running statistics use streaming/online algorithms so
+memory stays bounded regardless of layer size: Welford's algorithm for
+mean/standard deviation (numerically stable, unlike a naive sum-of-
+squares — matters for fields with large values like cadastral
+coordinates), reservoir sampling (`HISTOGRAM_SAMPLE_LIMIT`, 50,000
+values by default) for percentiles/histogram/outlier estimates, and a
+capped set (`DISTINCT_TRACK_LIMIT`) / capped category dict
+(`MAX_CATEGORIES_TRACKED`) for distinct-value tracking. Feature selection
+(nulls/min/max/outliers) is resolved lazily from a QGIS expression at
+click time, so profiling never has to build a feature-id list per value.
+
+For very large fields, percentiles/outlier counts/charts are estimated
+from the sample rather than exact — the UI says so via a message-bar
+notice. Counts, nulls, min and max are always exact (computed from every
+feature, not the sample). Clicking a stat cell to select features is
+always exact too, since it re-evaluates the expression against the whole
+layer at that moment rather than reusing the sample.
+
 
 Implemented:
 - Vector layer selector + field list, docked at the bottom of the QGIS

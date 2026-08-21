@@ -44,6 +44,7 @@ from qgis.PyQt.QtWidgets import (
     QHeaderView,
     QAbstractItemView,
     QStackedWidget,
+    QProgressBar,
 )
 
 from matplotlib.figure import Figure
@@ -56,6 +57,7 @@ except ImportError:  # older matplotlib bundled with QGIS
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from . import profiling_engine
+from . import profiling_task
 from . import selection_helper
 from . import symbology_helper
 
@@ -124,6 +126,7 @@ class DataEngineeringDock(QDockWidget):
         self.field_order = []       # row index -> field_name, mirrors the table
         self.detail_field = None
         self._chart_mode = None
+        self._active_task = None    # currently running ProfileLayerTask, if any
 
         self._build_ui()
 
@@ -157,8 +160,19 @@ class DataEngineeringDock(QDockWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         header_row = QHBoxLayout()
-        header_row.addWidget(QLabel('All fields'))
+        self.status_label = QLabel('All fields')
+        header_row.addWidget(self.status_label)
         header_row.addStretch()
+
+        # Shown only while a ProfileLayerTask is running in the
+        # background, so the user always sees that the plugin is working
+        # instead of the panel looking frozen on a large layer.
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedWidth(160)
+        self.progress_bar.setVisible(False)
+        header_row.addWidget(self.progress_bar)
+
         self.refresh_button = QPushButton('Refresh')
         self.refresh_button.clicked.connect(self._refresh_all_fields)
         header_row.addWidget(self.refresh_button)
@@ -215,6 +229,8 @@ class DataEngineeringDock(QDockWidget):
     # Layer / profiling
     # ------------------------------------------------------------------
     def _on_layer_changed(self, layer):
+        self._cancel_active_task()
+
         self.current_layer = layer
         self.profiles = {}
         self.field_order = []
@@ -239,19 +255,72 @@ class DataEngineeringDock(QDockWidget):
 
         self._refresh_all_fields()
 
+    def _cancel_active_task(self):
+        if self._active_task is not None:
+            self._active_task.cancel()
+            self._active_task = None
+        self.progress_bar.setVisible(False)
+        self.refresh_button.setEnabled(True)
+        self.layer_combo.setEnabled(True)
+
     def _refresh_all_fields(self):
-        """(Re)computes the profile of every field and repopulates the
-        table. For very large layers with many fields this is where a
-        background QgsTask + progress bar would be added; kept simple
-        and synchronous here."""
+        """(Re)computes the profile of every field, in the background so
+        the QGIS UI is never blocked regardless of layer size, and
+        repopulates the table when done."""
         if self.current_layer is None:
             return
 
-        self.profiles = {
-            field_info['name']: profiling_engine.profile_field(self.current_layer, field_info['name'])
-            for field_info in profiling_engine.list_fields(self.current_layer)
-        }
+        self._cancel_active_task()
+
+        layer = self.current_layer
+        field_names = [f['name'] for f in profiling_engine.list_fields(layer)]
+
+        self.status_label.setText(f'Profiling "{layer.name()}"...')
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.refresh_button.setEnabled(False)
+        self.layer_combo.setEnabled(False)
+
+        task = profiling_task.ProfileLayerTask(layer, field_names, self._on_profile_task_finished)
+        task.progressChanged.connect(self._on_profile_task_progress)
+        self._active_task = task
+        QgsApplication.taskManager().addTask(task)
+
+    def _on_profile_task_progress(self, progress):
+        self.progress_bar.setValue(int(progress))
+
+    def _on_profile_task_finished(self, task, success):
+        # QGIS may still fire this for a task we've already superseded
+        # (e.g. the user switched layers or hit Refresh again mid-run and
+        # we canceled + replaced self._active_task): ignore anything that
+        # isn't the task we're currently tracking.
+        if self._active_task is not task:
+            return
+        self._active_task = None
+
+        self.progress_bar.setVisible(False)
+        self.refresh_button.setEnabled(True)
+        self.layer_combo.setEnabled(True)
+        self.status_label.setText('All fields')
+
+        if not success:
+            if task.error is not None:
+                self.iface.messageBar().pushWarning(
+                    'Data Engineering Toolkit',
+                    f'Profiling failed: {task.error}',
+                )
+            return  # canceled, or failed with no exception: leave the table as-is
+
+        self.profiles = task.results or {}
         self._populate_stats_table()
+
+        if any(p.get('sampled') for p in self.profiles.values()):
+            self.iface.messageBar().pushInfo(
+                'Data Engineering Toolkit',
+                f'Percentiles and charts for very large fields are estimated from a sample '
+                f'of up to {profiling_engine.HISTOGRAM_SAMPLE_LIMIT:,} values; counts, '
+                'nulls, min and max cover every feature.',
+            )
 
     # ------------------------------------------------------------------
     # Stats table (all fields, one column per statistic + chart thumbnail)
@@ -270,7 +339,10 @@ class DataEngineeringDock(QDockWidget):
                     pixmap = self._render_thumbnail(profile)
                     if pixmap is not None:
                         item.setIcon(QIcon(pixmap))
-                        item.setToolTip('Click to open the full chart')
+                        tooltip = 'Click to open the full chart'
+                        if profile.get('sampled'):
+                            tooltip += f' (based on a sample of {profiling_engine.HISTOGRAM_SAMPLE_LIMIT:,} features)'
+                        item.setToolTip(tooltip)
                 else:
                     value = profiling_engine.stat_value(profile, key)
                     item = QTableWidgetItem(self._format_value(value))
@@ -308,18 +380,23 @@ class DataEngineeringDock(QDockWidget):
         if self.current_layer is None:
             return
 
-        ids = None
+        # Selections are resolved lazily from an expression at click time
+        # instead of from precomputed id lists: profiling large layers
+        # (e.g. cadastral data) no longer has to build and hold a feature
+        # id list per statistic just in case the user clicks it.
+        expr = None
         if key == 'null_count':
-            ids = profile.get('null_ids', [])
-        elif key == 'min_value':
-            ids = profile.get('min_ids', [])
-        elif key == 'max_value':
-            ids = profile.get('max_ids', [])
-        elif key == 'outlier_count':
-            ids = profile.get('outlier_ids', [])
+            expr = selection_helper.expression_for_null(field_name)
+        elif key == 'min_value' and profile.get('min_value') is not None:
+            expr = selection_helper.expression_for_equal(field_name, profile['min_value'])
+        elif key == 'max_value' and profile.get('max_value') is not None:
+            expr = selection_helper.expression_for_equal(field_name, profile['max_value'])
+        elif key == 'outlier_count' and profile.get('outlier_bounds'):
+            bounds = profile['outlier_bounds']
+            expr = f'"{field_name}" < {bounds["lower"]} OR "{field_name}" > {bounds["upper"]}'
 
-        if ids is not None:
-            selection_helper.select_by_ids(self.current_layer, ids, canvas=self.canvas)
+        if expr:
+            selection_helper.select_by_expression(self.current_layer, expr, canvas=self.canvas)
 
     def _on_field_list_item_changed(self, current_item, _previous_item):
         """Clicking a field in the left list jumps to (and highlights)
@@ -397,7 +474,10 @@ class DataEngineeringDock(QDockWidget):
         if profile is None:
             return
         self.detail_field = field_name
-        self.detail_title_label.setText(f'Field: {field_name}')
+        title = f'Field: {field_name}'
+        if profile.get('sampled'):
+            title += f'  (chart based on a sample of {profiling_engine.HISTOGRAM_SAMPLE_LIMIT:,} features)'
+        self.detail_title_label.setText(title)
         self._draw_detail_chart(profile)
         self.stack.setCurrentIndex(1)
 
