@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# JetBrains / PyCharm project files (machine-specific, not part of the plugin)
+.idea/
+
+# Packaging output
+*.zip
+
+# OS noise
+.DS_Store
+Thumbs.db

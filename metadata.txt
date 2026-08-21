@@ -1,0 +1,24 @@
+[general]
+name=Data Engineering Toolkit
+qgisMinimumVersion=3.28
+description=Panel for profiling, cleaning and exploring vector data, inspired by the Data Engineering view in ArcGIS Pro, with interactive feature selection from statistics and charts.
+version=0.4.0
+author=Pep
+email=pepquevedougr@gmail.com
+
+about=Data Engineering Toolkit adds a dockable panel to QGIS, docked at the bottom of the window next to the Attribute Table, with a statistics grid showing every field of the active layer at once (Field Type, Count, Nulls, Distinct, Sum, Min/Max, Range, Mean, Median, Std Dev, Percentiles, Outliers) plus a small chart-preview thumbnail per row. A key difference from ArcGIS Pro: you can click a statistic cell to select on the canvas the corresponding features (nulls, minimum/maximum value, outliers), clicking a thumbnail opens a full interactive chart where clicking a bar selects the matching features too, and hovering a field in the field list reveals a Symbology button that renders the layer by that field (white-to-dark-blue graduated for numeric fields, multicolor categorized for text fields) — making it easy to quickly explore the spatial distribution of data quality issues.
+
+tracker=
+repository=
+homepage=
+
+hasProcessingProvider=yes
+
+tags=data engineering,data quality,profiling,statistics,data cleaning,outliers,selection,QA/QC
+
+category=Analysis
+icon=icons/icon.svg
+experimental=True
+deprecated=False
+
+server=False
