@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # LTR (Qt5) and current stable (Qt6 / QGIS 4).
+        qgis: ['ltr', 'stable']
+    container:
+      image: qgis/qgis:${{ matrix.qgis }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      XDG_RUNTIME_DIR: /tmp/runtime-root
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          python3 -m pip install --break-system-packages pytest || python3 -m pip install pytest
+      - name: Run tests
+        run: python3 -m pytest tests -v
+
+  translations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Every string is translated
+        run: python scripts/build_translations.py --check

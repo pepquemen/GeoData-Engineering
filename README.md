@@ -1,114 +1,148 @@
 # Data Engineering Toolkit (QGIS)
 
-A QGIS plugin inspired by the **Data Engineering** view in ArcGIS Pro: a
-dockable panel with a field list, a statistics table and interactive
-charts, with the twist that you can click a statistic (nulls, min, max,
-outliers) or a chart bar to **select the corresponding features on the
-map**.
+A data-profiling panel for QGIS vector layers, inspired by the **Data
+Engineering** view in ArcGIS Pro — with everything connected to the map:
+click a statistic or a chart bar and the matching features are selected.
+
+- **Every field at once**: type, nulls, distinct values (and candidate
+  keys), min, max, mean, median, standard deviation, P25/P75, sum, range
+  and outliers, plus a distribution sparkline per field.
+- **One click to the map**: nulls, minimum, maximum, outliers and any
+  histogram or category bar select their features (Ctrl adds, Ctrl+Shift
+  removes). Double-click or right-click to open them in the attribute
+  table, flash them, or copy values.
+- **Brushing & linking**: your current map selection is drawn over the
+  detail chart, so you can see where it falls in the distribution.
+- **Built for big layers** (e.g. cadastral data): background, cancelable,
+  single-pass profiling with bounded memory; results cached per layer and
+  flagged when the layer is edited (optional auto-refresh).
+- **Every common type**: integers, decimals, text, booleans, dates,
+  datetimes and times.
+- **Light and dark themes** that follow QGIS, English and Spanish.
+
+## Using it
+
+Open the panel from the toolbar icon or *Plugins → Data Engineering
+Toolkit*. It docks at the bottom, next to the attribute table.
+
+| Control | What it does |
+|---|---|
+| Layer selector | Layer to profile (vector layers and tables) |
+| Filter fields | Filters the table by field name or alias |
+| `SEL` | Profile only the selected features; follows the map selection |
+| `AUTO` | Re-profile automatically when the layer data changes |
+| `REFRESH` / `STOP` | Profile again / cancel a running profile |
+| Options (≡) | Theme, what the map does when selecting (zoom / pan / nothing, flash), outlier rule (k = 1.5 or 3), copy the table, restore the layer style |
+
+In the table, cells with a small corner tick are clickable. Click a
+column header to sort by that statistic. Hover a field name and click
+the bars icon to symbolize the layer by that field; it is applied as a
+new layer style (`DET · <field>`), so your original style is kept and can
+be restored from the options menu or the layer's *Styles* menu.
+
+A `~` in front of a value means it was estimated from a random sample
+(see *How statistics are computed*). Selections are always exact.
+
+## How statistics are computed
+
+- Features are read **once**, without geometry, in a background
+  `QgsTask`. Values are buffered and processed in batches with numpy.
+- **Exact**: feature count, nulls, min, max, sum, mean and standard
+  deviation (Welford / Chan merge, numerically stable for large
+  magnitudes such as projected coordinates).
+- **Distinct values**: exact up to 20 000, then reported as `>20 000`.
+- **Median, percentiles, histogram and outlier count**: from a uniform
+  random sample of up to 50 000 values per field (reservoir sampling,
+  Algorithm L); exact when the field has fewer values. Histogram heights
+  are scaled back to the full population.
+- **Outliers**: Tukey fences (`Q1 − k·IQR`, `Q3 + k·IQR`). When more than
+  half of the values are identical (IQR = 0) they are not reported, since
+  every other value would be flagged.
+- **Heavy tails**: when the fences cover less than half of the range, the
+  histogram shows the bulk of the data plus `<` / `>` overflow bars,
+  which are selectable too.
+- **Categories**: exact counts up to 500 categories; beyond that the
+  Misra–Gries algorithm keeps every frequent category whatever its
+  position in the layer (counts become lower bounds, shown with `≥`).
 
 ## Structure
 
 ```
 data_engineering_toolkit/
 ├── __init__.py                 # classFactory(), QGIS entry point
-├── metadata.txt                 # plugin metadata (name, version...)
-├── data_engineering_plugin.py   # plugin lifecycle (initGui/unload)
-├── data_engineering_dock.py     # UI: splitter (field list | stats table + chart)
-├── profiling_engine.py          # pure logic: single-pass streaming statistics, IQR outliers, histogram
-├── profiling_task.py            # runs profiling_engine on a background QgsTask (progress bar, non-blocking UI)
-├── selection_helper.py          # reusable feature selection (table and chart)
-├── symbology_helper.py          # "explore by field" graduated / categorized renderers
-└── icons/icon.svg
+├── metadata.txt
+├── data_engineering_plugin.py  # lifecycle: toolbar action, dock, translator
+├── data_engineering_dock.py    # the panel (UI logic only)
+├── profiling_engine.py         # QGIS side: field kinds, single-pass read
+├── profiling_task.py           # background QgsTask wrapper
+├── stats_core.py               # pure streaming statistics (no QGIS / Qt)
+├── selection_helper.py         # kind-aware expressions, selection, zoom
+├── symbology_helper.py         # non-destructive "explore by field" styles
+├── compat.py                   # QGIS 3.28+ / QGIS 4 (Qt6) shims
+├── translation.py              # tr()
+├── ui/
+│   ├── theme.py                # colour tokens, fonts, stylesheet, matplotlib style
+│   ├── widgets.py              # chamfered frame, progress, banner, menus
+│   ├── stats_model.py          # table model + filter proxy
+│   ├── delegates.py            # badges, null bars, sparklines
+│   ├── chart_panel.py          # detail panel and interactive chart
+│   ├── formatting.py           # locale-aware numbers, dates, durations
+│   ├── icons.py                # theme-coloured line icons
+│   └── settings.py             # persisted preferences
+├── fonts/                      # JetBrains Mono (SIL OFL 1.1)
+├── i18n/                       # .ts sources and compiled .qm
+├── icons/icon.svg
+├── scripts/build_translations.py
+└── tests/                      # pytest: statistics, engine, panel
 ```
 
-## Installing for development
+## Development
 
-1. Locate your QGIS profile's plugins folder:
-   - Windows: `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\`
-   - Linux/macOS: `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
-2. Copy (or symlink, better for development) the whole
-   `data_engineering_toolkit` folder into that `plugins` path.
-3. Open QGIS → **Plugins → Manage and Install Plugins** → "Installed"
-   tab → tick the checkbox for "Data Engineering Toolkit".
-4. A toolbar icon and a Plugins-menu entry will appear that toggle the
-   panel, which docks at the bottom of the window (same area as the
-   native Attribute Table).
+1. Clone into your QGIS profile's plugins folder **with the folder name
+   `data_engineering_toolkit`** (a name with dashes is not a valid Python
+   module, so QGIS would not load it):
 
-For iterative development, install the
-[Plugin Reloader](https://plugins.qgis.org/plugins/pluginreloader/)
-plugin, which lets you reload this plugin without restarting QGIS after
-each change.
+   ```bash
+   cd "%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins"   # Windows
+   git clone https://github.com/pepquemen/GeoData-Engineering.git data_engineering_toolkit
+   ```
+
+2. Enable it in *Plugins → Manage and Install Plugins → Installed*.
+   [Plugin Reloader](https://plugins.qgis.org/plugins/pluginreloader/)
+   reloads it after each change without restarting QGIS.
+
+### Tests
+
+Run with the Python interpreter that has the QGIS bindings (OSGeo4W
+Shell on Windows, or the system Python on Linux):
+
+```bash
+python -m pip install pytest
+QT_QPA_PLATFORM=offscreen python -m pytest
+```
+
+`tests/test_stats_core.py` needs only numpy; the other tests use a real
+QGIS and run headless. GitHub Actions runs them against the QGIS LTR
+(Qt5) and the current stable release (QGIS 4, Qt6).
+
+### Translations
+
+Source strings are English, wrapped in `tr()`. After changing UI text:
+
+```bash
+python scripts/build_translations.py
+```
+
+It adds new strings to `i18n/data_engineering_toolkit_es.ts` (translate
+them there, e.g. with Qt Linguist) and compiles the `.qm` files with
+`lrelease`.
 
 ## Dependencies
 
-- `numpy` (for histograms and outlier detection) — normally already
-  bundled with QGIS's Python.
-- `matplotlib` — also usually bundled with QGIS, but if your install is
-  missing it: `python3 -m pip install matplotlib` using the Python
-  interpreter QGIS uses (on OSGeo4W: `OSGeo4W Shell` → `py3_env` →
-  `pip install matplotlib`).
+`numpy` and `matplotlib`, both bundled with QGIS on Windows and macOS.
+On Linux, install your distribution's `python3-matplotlib` if missing.
 
-## Current status (v0.6.0)
+## License
 
-### Performance on large layers (e.g. cadastral data)
-
-Profiling runs on a background `QgsTask` (`profiling_task.py`), so the
-QGIS UI is never blocked, however large the layer is — a progress bar in
-the panel header shows it's working. Reading features happens through a
-`QgsVectorLayerFeatureSource` cloned on the main thread before the task
-starts, which is the QGIS-documented safe way to read a layer's features
-from a worker thread.
-
-`profiling_engine.profile_all_fields()` computes every field's
-statistics in a **single pass** over the layer (previously it was one
-pass per field, and before that even one pass per statistic). Geometry
-is never read. Running statistics use streaming/online algorithms so
-memory stays bounded regardless of layer size: Welford's algorithm for
-mean/standard deviation (numerically stable, unlike a naive sum-of-
-squares — matters for fields with large values like cadastral
-coordinates), reservoir sampling (`HISTOGRAM_SAMPLE_LIMIT`, 50,000
-values by default) for percentiles/histogram/outlier estimates, and a
-capped set (`DISTINCT_TRACK_LIMIT`) / capped category dict
-(`MAX_CATEGORIES_TRACKED`) for distinct-value tracking. Feature selection
-(nulls/min/max/outliers) is resolved lazily from a QGIS expression at
-click time, so profiling never has to build a feature-id list per value.
-
-For very large fields, percentiles/outlier counts/charts are estimated
-from the sample rather than exact — the UI says so via a message-bar
-notice. Counts, nulls, min and max are always exact (computed from every
-feature, not the sample). Clicking a stat cell to select features is
-always exact too, since it re-evaluates the expression against the whole
-layer at that moment rather than reusing the sample.
-
-
-Implemented:
-- Vector layer selector + field list, docked at the bottom of the QGIS
-  window (same area as the native Attribute Table).
-- Statistics grid showing every field of the active layer at once: one
-  row per field, one column per statistic (Field Type, Count, Null
-  Count, Distinct, Sum, Min, Max, Range, Mean, Median, Std Dev, P25,
-  P75, Outliers), plus a small chart-preview thumbnail column. Clicking
-  a stat cell (nulls/min/max/outliers) selects the matching features on
-  the map.
-- Clicking a thumbnail opens a full-size interactive chart on a second
-  page (histogram for numeric fields, bar chart for categorical ones),
-  with a "Back to statistics" button to return to the grid. Clicking a
-  bar there also selects the matching features on the map.
-- Profiling logic decoupled from the UI (`profiling_engine.py`), ready
-  to be reused by a future Processing algorithm (batch mode across
-  several layers).
-- Hovering a field in the left field list reveals a Symbology button.
-  Clicking it renders the active layer by that field: a white -> dark
-  blue graduated (quantile) renderer for numeric fields, or a
-  categorized renderer with one distinct hue per value for text fields
-  (capped at 40 categories for readability; see `symbology_helper.py`).
-
-Suggested next steps:
-- Color indicator in the field list based on % of null values.
-- Profiling cache with invalidation on layer edits (`committedAttributeValuesChanges`,
-  `featuresAdded`, `featuresDeleted` signals).
-- Data-cleaning tools (fill nulls, remove duplicates, fix geometries) as
-  Processing algorithms, launchable from the table.
-- Export the profiling report to HTML/PDF.
-- Packaging with `pb_tool` or `qgis-plugin-ci` for publishing to the
-  official plugin repository.
+GPL-2.0-or-later (see `LICENSE`). The bundled JetBrains Mono font is
+licensed under the SIL Open Font License 1.1 (`fonts/OFL.txt`).

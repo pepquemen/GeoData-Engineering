@@ -2,12 +2,14 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # JetBrains / PyCharm project files (machine-specific, not part of the plugin)
 .idea/
 
 # Packaging output
 *.zip
+dist/
 
 # OS noise
 .DS_Store

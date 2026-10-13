@@ -1,20 +1,34 @@
 [general]
 name=Data Engineering Toolkit
 qgisMinimumVersion=3.28
-description=Panel for profiling, cleaning and exploring vector data, inspired by the Data Engineering view in ArcGIS Pro, with interactive feature selection from statistics and charts.
-version=0.6.0
+qgisMaximumVersion=4.99
+supportsQt6=True
+description=Data profiling panel for vector layers: statistics for every field at once, interactive charts, and one-click selection of nulls, extremes and outliers on the map.
+version=0.7.0
 author=Pep
 email=pepquevedougr@gmail.com
 
-about=Data Engineering Toolkit adds a dockable panel to QGIS, docked at the bottom of the window next to the Attribute Table, with a statistics grid showing every field of the active layer at once (Field Type, Count, Nulls, Distinct, Sum, Min/Max, Range, Mean, Median, Std Dev, Percentiles, Outliers) plus a small chart-preview thumbnail per row. A key difference from ArcGIS Pro: you can click a statistic cell to select on the canvas the corresponding features (nulls, minimum/maximum value, outliers), clicking a thumbnail opens a full interactive chart where clicking a bar selects the matching features too, and hovering a field in the field list reveals a Symbology button that renders the layer by that field (white-to-dark-blue graduated for numeric fields, multicolor categorized for text fields) — making it easy to quickly explore the spatial distribution of data quality issues.
+about=Data Engineering Toolkit adds a panel docked at the bottom of the QGIS window that profiles every field of a vector layer at once: type, nulls, distinct values (and candidate keys), min/max, mean, median, standard deviation, percentiles, sum, range and outliers, plus a distribution sparkline per field. Inspired by the Data Engineering view in ArcGIS Pro, with a key difference: everything is connected to the map. Click a statistic (nulls, min, max, outliers) or a chart bar to select those features (Ctrl to add, Ctrl+Shift to remove), open them in the attribute table, or see your current map selection overlaid on the chart. Profiling runs in the background in a single pass with bounded memory, so it stays usable on large datasets such as cadastral layers, and results are refreshed when the layer is edited. Works with numbers, text, booleans, dates, datetimes and times. Light and dark themes, English and Spanish.
 
-tracker=
-repository=
-homepage=
+tracker=https://github.com/pepquemen/GeoData-Engineering/issues
+repository=https://github.com/pepquemen/GeoData-Engineering
+homepage=https://github.com/pepquemen/GeoData-Engineering
 
-hasProcessingProvider=yes
+hasProcessingProvider=no
 
-tags=data engineering,data quality,profiling,statistics,data cleaning,outliers,selection,QA/QC
+changelog=
+    0.7.0
+    - New interface: table + detail chart side by side, sortable columns, field filter, type badges, null bars, sparklines, light/dark themes, Spanish translation
+    - Background profiling is cancelable; results are cached per layer and flagged when the data changes (optional auto-refresh)
+    - "Selected features only" scope; map selection overlaid on the chart
+    - Dates, datetimes, times and booleans are profiled and selectable
+    - Heavy-tailed fields: histogram focused on the bulk of the data with overflow bins
+    - Right-click menu: select/add/remove, flash, open in attribute table, copy
+    - Non-destructive symbology (separate layer style, original kept)
+    - 2x faster profiling, exact feature counts, frequent categories never lost
+    - Fixes: crash risk when cancelling, ghost toolbar on reload, scientific notation for large numbers, quoting of field names, unreliable min/max selection on decimals
+
+tags=data engineering,data quality,profiling,statistics,data cleaning,outliers,selection,QA/QC,attribute table,histogram
 
 category=Analysis
 icon=icons/icon.svg
